@@ -3710,6 +3710,16 @@ void QueryAnalyzer::initializeTableExpressionData(const QueryTreeNodePtr & table
             auto column_node = std::make_shared<ColumnNode>(column_name_and_type, table_expression_node);
             table_expression_data.column_name_to_column_node.emplace(column_name_and_type.name, column_node);
         }
+
+        /** Enable subcolumn support for QUERY/UNION nodes.
+          * This allows subcolumns to be resolved directly as ColumnNodes with the subcolumn name,
+          * rather than being wrapped in getSubcolumn function.
+          * This is important for proper subcolumn pruning when using CTEs or subqueries.
+          * Example: WITH foo AS (SELECT * FROM test_table) SELECT event.class_name FROM foo
+          * Without this, event.class_name would be wrapped as getSubcolumn(event, 'class_name'),
+          * preventing the storage from doing subcolumn pruning.
+          */
+        table_expression_data.supports_subcolumns = true;
     }
 
     table_expression_data.column_identifier_first_parts.reserve(table_expression_data.column_name_to_column_node.size());

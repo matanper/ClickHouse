@@ -32,7 +32,35 @@ std::unordered_set<size_t> convertUsedColumnNamesToUsedProjectionIndexes(const Q
     {
         const auto & projection_column = projection_columns[i];
         if (used_column_names.contains(projection_column.name))
+        {
             result.insert(i);
+            continue;
+        }
+
+        /** Check if any used column is a subcolumn of this projection column.
+          * This is needed for proper subcolumn pruning with CTEs/subqueries.
+          * Example: WITH foo AS (SELECT * FROM test_table) SELECT event.class_name FROM foo
+          * Here, 'event.class_name' is used but the CTE outputs 'event'.
+          * We need to keep 'event' in the projection since 'event.class_name' is derived from it.
+          */
+        const auto & projection_column_name = projection_column.name;
+        const auto & projection_column_type = projection_column.type;
+        std::string prefix = projection_column_name + ".";
+
+        for (const auto & used_column_name : used_column_names)
+        {
+            if (used_column_name.starts_with(prefix))
+            {
+                /// Extract the subcolumn name (part after the dot)
+                std::string_view subcolumn_name(used_column_name.data() + prefix.size(), used_column_name.size() - prefix.size());
+                /// Check if the projection column type actually has this subcolumn
+                if (projection_column_type->tryGetSubcolumnType(subcolumn_name))
+                {
+                    result.insert(i);
+                    break;
+                }
+            }
+        }
     }
 
     return result;

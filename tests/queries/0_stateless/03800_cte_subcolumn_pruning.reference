@@ -1,0 +1,24 @@
+Without CTE (JSON):
+Expression ((Project names + (Projection + Change column names to column identifiers)))
+Header: event.class_name String
+  ReadFromPreparedSource (Read from NullSource)
+  Header: event.class_name String
+With CTE (JSON):
+Expression ((Project names + (Projection + (Change column names to column identifiers + (Project names + (Projection + Change column names to column identifiers))))))
+Header: event.class_name String
+  ReadFromPreparedSource (Read from NullSource)
+  Header: event.class_name String
+Query result (JSON):
+test
+Without CTE (Tuple):
+Expression ((Project names + (Projection + Change column names to column identifiers)))
+Header: event.class_name String
+  ReadFromPreparedSource (Read from NullSource)
+  Header: event.class_name String
+With CTE (Tuple):
+Expression ((Project names + (Projection + (Change column names to column identifiers + (Project names + (Projection + Change column names to column identifiers))))))
+Header: event.class_name String
+  ReadFromPreparedSource (Read from NullSource)
+  Header: event.class_name String
+Query result (Tuple):
+test
