@@ -524,158 +524,166 @@ void SubcolumnPushdownPass::run(QueryTreeNodePtr & query_tree_node, ContextPtr c
     if (subcolumn_accesses_by_source.empty())
         return;
 
-    /// For each source with subcolumn accesses, clone once and add all needed subcolumns
-    for (auto & [original_source_ptr, accesses] : subcolumn_accesses_by_source)
+    /// Only the source that is the root of the join tree can be rewritten (see `tryCloneTopLevelQueryNode`).
+    /// The collector also records accesses of sources in nested scopes, e.g. a scalar subquery inside the
+    /// source's projection. Those must not be touched here: cloning the outer source replaces the subtree
+    /// that contains them, and their `ColumnNode` / `QueryTreeNodePtr` pointers may dangle afterwards.
+    /// Only the join tree of the cloned source is revisited by the recursive `run` below.
+    auto & join_tree = root_query_node->getJoinTreeNode();
+    auto source_it = subcolumn_accesses_by_source.find(join_tree.get());
+    if (source_it == subcolumn_accesses_by_source.end())
+        return;
+
+    IQueryTreeNode * original_source_ptr = source_it->first;
+    auto & accesses = source_it->second;
+
+    /// Skip empty access lists (shouldn't happen, but defensive check)
+    if (accesses.empty())
+        return;
+
+    /// Get the source from any access (they all reference the same source)
+    auto column_source = accesses[0].column_node->getColumnSourceOrNull();
+
+    /// Source must still be valid (weak pointer might have expired)
+    if (!column_source)
+        return;
+
+    /// Clone the source to avoid modifying shared nodes
+    auto cloned_source = tryCloneTopLevelQueryNode(join_tree, column_source);
+
+    /// Skip if cloning failed (e.g., the join tree is a JOIN)
+    if (!cloned_source)
+        return;
+
+    /// Update all columns that reference the original source to point to the cloned source.
+    /// This is necessary because columns not involved in subcolumn access (e.g., `id` in
+    /// `SELECT id, data.a FROM view`) would otherwise be left with orphaned sources.
+    auto it = all_columns_by_source.find(original_source_ptr);
+    if (it != all_columns_by_source.end())
     {
-        /// Skip empty access lists (shouldn't happen, but defensive check)
-        if (accesses.empty())
-            continue;
-
-        /// Get the source from any access (they all reference the same source)
-        auto column_source = accesses[0].column_node->getColumnSourceOrNull();
-
-        /// Source must still be valid (weak pointer might have expired)
-        if (!column_source)
-            continue;
-
-        /// Clone the source to avoid modifying shared nodes
-        auto & join_tree = root_query_node->getJoinTreeNode();
-        auto cloned_source = tryCloneTopLevelQueryNode(join_tree, column_source);
-
-        /// Skip if cloning failed (e.g., source is inside a JOIN)
-        if (!cloned_source)
-            continue;
-
-        /// Update all columns that reference the original source to point to the cloned source.
-        /// This is necessary because columns not involved in subcolumn access (e.g., `id` in
-        /// `SELECT id, data.a FROM view`) would otherwise be left with orphaned sources.
-        auto it = all_columns_by_source.find(original_source_ptr);
-        if (it != all_columns_by_source.end())
-        {
-            for (auto * col : it->second)
-                col->setColumnSource(cloned_source);
-        }
-
-        auto * cloned_query_source = cloned_source->as<QueryNode>();
-
-        /// Cloned source must be a QueryNode to modify its projection
-        if (!cloned_query_source)
-            continue;
-
-        /// Get unique subcolumns to add (deduplicate by full_subcolumn_name).
-        /// Multiple accesses to the same subcolumn (e.g., tup.a used twice) share one projection column.
-        std::unordered_map<String, SubcolumnAccess *> unique_subcolumns;
-        for (auto & access : accesses)
-            unique_subcolumns.try_emplace(access.full_subcolumn_name, &access);
-
-        /// Count how many times each base column of this source is referenced anywhere in the query.
-        /// A base column may only be dropped from the projection once every one of its references has
-        /// been rewritten into a subcolumn reference - otherwise the outer query would still ask for a
-        /// column that the source no longer produces (`SELECT tup, tup.a FROM (SELECT tup FROM t)`).
-        std::unordered_map<String, size_t> total_references_by_base_column;
-        if (it != all_columns_by_source.end())
-        {
-            for (const auto * col : it->second)
-                ++total_references_by_base_column[col->getColumnName()];
-        }
-
-        /// Candidate base columns to drop, mapped to their index in the source projection.
-        std::unordered_map<String, size_t> removal_candidates;
-
-        /// Add new subcolumn projections
-        auto & cloned_projection_nodes = cloned_query_source->getProjection().getNodes();
-        auto projection_columns = cloned_query_source->getProjectionColumns();
-
-        /// Map from full_subcolumn_name to its new projection index
-        std::unordered_map<String, size_t> subcolumn_to_new_index;
-
-        for (auto & [full_subcolumn_name, access_ptr] : unique_subcolumns)
-        {
-            auto & access = *access_ptr;
-
-            /// Projection index must be valid (defensive check against data corruption)
-            if (access.projection_index >= cloned_projection_nodes.size())
-                continue;
-
-            auto * proj_column = cloned_projection_nodes[access.projection_index]->as<ColumnNode>();
-
-            /// Projection node must be a ColumnNode to extract subcolumn from
-            if (!proj_column)
-                continue;
-
-            /// Create the subcolumn projection node
-            auto new_proj_node = tryCreateSubcolumnProjectionNode(
-                proj_column, access.subcolumn_name, access.subcolumn_type, context);
-
-            /// Skip if we couldn't create the projection node
-            if (!new_proj_node)
-                continue;
-
-            /// Add to projection (at the end)
-            size_t new_index = cloned_projection_nodes.size();
-            cloned_projection_nodes.push_back(new_proj_node);
-            projection_columns.push_back(NameAndTypePair{access.full_subcolumn_name, access.subcolumn_type});
-
-            subcolumn_to_new_index[full_subcolumn_name] = new_index;
-            removal_candidates.emplace(access.base_column_name, access.projection_index);
-        }
-
-        /// Replace all getSubcolumn calls with direct column references to the new projection columns
-        std::unordered_map<String, size_t> rewritten_references_by_base_column;
-        for (auto & access : accesses)
-        {
-            auto subcolumn_it = subcolumn_to_new_index.find(access.full_subcolumn_name);
-
-            /// If we couldn't add this subcolumn to projection, just update the source reference
-            if (subcolumn_it == subcolumn_to_new_index.end())
-            {
-                access.column_node->setColumnSource(cloned_source);
-                continue;
-            }
-
-            /// Replace the getSubcolumn call with a direct column reference
-            NameAndTypePair new_column_name_and_type{access.full_subcolumn_name, access.subcolumn_type};
-            *access.node_to_replace = std::make_shared<ColumnNode>(new_column_name_and_type, cloned_source);
-            ++rewritten_references_by_base_column[access.base_column_name];
-        }
-
-        /// Remove the base columns that are now completely unused, i.e. every reference to them was
-        /// rewritten above. A base column that is still read directly stays in the projection.
-        std::vector<size_t> indices_to_remove;
-        for (const auto & [base_column_name, projection_index] : removal_candidates)
-        {
-            if (total_references_by_base_column[base_column_name] == rewritten_references_by_base_column[base_column_name])
-                indices_to_remove.push_back(projection_index);
-        }
-
-        /// We need to remove from highest index to lowest to avoid invalidating indices.
-        std::sort(indices_to_remove.begin(), indices_to_remove.end(), std::greater<>());
-
-        for (size_t idx : indices_to_remove)
-        {
-            /// Defensive check to avoid out-of-bounds access
-            if (idx < cloned_projection_nodes.size())
-            {
-                cloned_projection_nodes.erase(cloned_projection_nodes.begin() + idx);
-                projection_columns.erase(projection_columns.begin() + idx);
-            }
-        }
-
-        /// The source query may carry a column alias list (`FROM (...) t(r, x)`). Those aliases were already
-        /// applied by name to the projection columns when the source was resolved, and `resolveProjectionColumns`
-        /// re-applies them positionally, so with the projection grown or shrunk above it would either throw
-        /// (`Number of aliases does not match number of projection columns`) or rename the wrong columns.
-        /// The names in `projection_columns` are the final ones, so the alias list is no longer needed.
-        cloned_query_source->setProjectionAliasesToOverride({});
-        cloned_query_source->resolveProjectionColumns(std::move(projection_columns));
-
-        /// If the source reads the column from a subquery itself, the projection got a `getSubcolumn` call
-        /// (see `tryCreateSubcolumnProjectionNode`) that can be pushed one level further down:
-        /// `SELECT tup.a FROM (SELECT tup FROM (SELECT tup FROM t))` has to read only `tup.a` from `t`.
-        /// Each level clones its own source, so this terminates at the depth of the nested subqueries.
-        QueryTreeNodePtr cloned_source_node = cloned_source;
-        run(cloned_source_node, context);
+        for (auto * col : it->second)
+            col->setColumnSource(cloned_source);
     }
+
+    auto * cloned_query_source = cloned_source->as<QueryNode>();
+
+    /// Cloned source must be a QueryNode to modify its projection
+    if (!cloned_query_source)
+        return;
+
+    /// Get unique subcolumns to add (deduplicate by full_subcolumn_name).
+    /// Multiple accesses to the same subcolumn (e.g., tup.a used twice) share one projection column.
+    std::unordered_map<String, SubcolumnAccess *> unique_subcolumns;
+    for (auto & access : accesses)
+        unique_subcolumns.try_emplace(access.full_subcolumn_name, &access);
+
+    /// Count how many times each base column of this source is referenced anywhere in the query.
+    /// A base column may only be dropped from the projection once every one of its references has
+    /// been rewritten into a subcolumn reference - otherwise the outer query would still ask for a
+    /// column that the source no longer produces (`SELECT tup, tup.a FROM (SELECT tup FROM t)`).
+    std::unordered_map<String, size_t> total_references_by_base_column;
+    if (it != all_columns_by_source.end())
+    {
+        for (const auto * col : it->second)
+            ++total_references_by_base_column[col->getColumnName()];
+    }
+
+    /// Candidate base columns to drop, mapped to their index in the source projection.
+    std::unordered_map<String, size_t> removal_candidates;
+
+    /// Add new subcolumn projections
+    auto & cloned_projection_nodes = cloned_query_source->getProjection().getNodes();
+    auto projection_columns = cloned_query_source->getProjectionColumns();
+
+    /// Map from full_subcolumn_name to its new projection index
+    std::unordered_map<String, size_t> subcolumn_to_new_index;
+
+    for (auto & [full_subcolumn_name, access_ptr] : unique_subcolumns)
+    {
+        auto & access = *access_ptr;
+
+        /// Projection index must be valid (defensive check against data corruption)
+        if (access.projection_index >= cloned_projection_nodes.size())
+            continue;
+
+        auto * proj_column = cloned_projection_nodes[access.projection_index]->as<ColumnNode>();
+
+        /// Projection node must be a ColumnNode to extract subcolumn from
+        if (!proj_column)
+            continue;
+
+        /// Create the subcolumn projection node
+        auto new_proj_node = tryCreateSubcolumnProjectionNode(
+            proj_column, access.subcolumn_name, access.subcolumn_type, context);
+
+        /// Skip if we couldn't create the projection node
+        if (!new_proj_node)
+            continue;
+
+        /// Add to projection (at the end)
+        size_t new_index = cloned_projection_nodes.size();
+        cloned_projection_nodes.push_back(new_proj_node);
+        projection_columns.push_back(NameAndTypePair{access.full_subcolumn_name, access.subcolumn_type});
+
+        subcolumn_to_new_index[full_subcolumn_name] = new_index;
+        removal_candidates.emplace(access.base_column_name, access.projection_index);
+    }
+
+    /// Replace all getSubcolumn calls with direct column references to the new projection columns
+    std::unordered_map<String, size_t> rewritten_references_by_base_column;
+    for (auto & access : accesses)
+    {
+        auto subcolumn_it = subcolumn_to_new_index.find(access.full_subcolumn_name);
+
+        /// If we couldn't add this subcolumn to projection, just update the source reference
+        if (subcolumn_it == subcolumn_to_new_index.end())
+        {
+            access.column_node->setColumnSource(cloned_source);
+            continue;
+        }
+
+        /// Replace the getSubcolumn call with a direct column reference
+        NameAndTypePair new_column_name_and_type{access.full_subcolumn_name, access.subcolumn_type};
+        *access.node_to_replace = std::make_shared<ColumnNode>(new_column_name_and_type, cloned_source);
+        ++rewritten_references_by_base_column[access.base_column_name];
+    }
+
+    /// Remove the base columns that are now completely unused, i.e. every reference to them was
+    /// rewritten above. A base column that is still read directly stays in the projection.
+    std::vector<size_t> indices_to_remove;
+    for (const auto & [base_column_name, projection_index] : removal_candidates)
+    {
+        if (total_references_by_base_column[base_column_name] == rewritten_references_by_base_column[base_column_name])
+            indices_to_remove.push_back(projection_index);
+    }
+
+    /// We need to remove from highest index to lowest to avoid invalidating indices.
+    std::sort(indices_to_remove.begin(), indices_to_remove.end(), std::greater<>());
+
+    for (size_t idx : indices_to_remove)
+    {
+        /// Defensive check to avoid out-of-bounds access
+        if (idx < cloned_projection_nodes.size())
+        {
+            cloned_projection_nodes.erase(cloned_projection_nodes.begin() + idx);
+            projection_columns.erase(projection_columns.begin() + idx);
+        }
+    }
+
+    /// The source query may carry a column alias list (`FROM (...) t(r, x)`). Those aliases were already
+    /// applied by name to the projection columns when the source was resolved, and `resolveProjectionColumns`
+    /// re-applies them positionally, so with the projection grown or shrunk above it would either throw
+    /// (`Number of aliases does not match number of projection columns`) or rename the wrong columns.
+    /// The names in `projection_columns` are the final ones, so the alias list is no longer needed.
+    cloned_query_source->setProjectionAliasesToOverride({});
+    cloned_query_source->resolveProjectionColumns(std::move(projection_columns));
+
+    /// If the source reads the column from a subquery itself, the projection got a `getSubcolumn` call
+    /// (see `tryCreateSubcolumnProjectionNode`) that can be pushed one level further down:
+    /// `SELECT tup.a FROM (SELECT tup FROM (SELECT tup FROM t))` has to read only `tup.a` from `t`.
+    /// Each level clones its own source, so this terminates at the depth of the nested subqueries.
+    QueryTreeNodePtr cloned_source_node = cloned_source;
+    run(cloned_source_node, context);
 }
 
 }
