@@ -5757,6 +5757,8 @@ Only a direct subcolumn access (`tup.a`, `getSubcolumn(tup, 'a')`) is pushed. A 
 
 The optimization is not applied when it would change the rows the subquery produces, for example when the subquery uses `DISTINCT`, `GROUP BY`, `LIMIT BY` or window functions.
 
+Only a subquery that is a single `SELECT` and is the only table expression of the outer query is rewritten. A subquery or a CTE that is a `UNION`, or a subquery joined with other tables, still reads the whole column.
+
 Possible values:
 
 - true, false

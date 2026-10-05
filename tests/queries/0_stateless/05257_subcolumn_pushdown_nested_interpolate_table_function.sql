@@ -1,5 +1,5 @@
 -- `optimize_push_subcolumns_into_subqueries`: a subcolumn read is pushed through every level of nested subqueries,
--- a subquery with `INTERPOLATE` is left alone, and so is a table function whose storage cannot read subcolumns.
+-- a subquery with `INTERPOLATE` is left alone, and a table function whose storage can read only tuple elements gets only those.
 
 SET enable_analyzer = 1;
 
@@ -23,7 +23,7 @@ SELECT (SELECT count() FROM foo GROUP BY r HAVING r.a = 'x'), r.a FROM foo ORDER
 WITH foo AS (SELECT tup AS r FROM t_subcolumn_pushdown_nested)
 SELECT (SELECT count() FROM foo GROUP BY r HAVING r.a = 'x'), r.a FROM foo ORDER BY ALL SETTINGS optimize_push_subcolumns_into_subqueries = 0;
 
-SELECT 'table function that cannot read subcolumns';
+SELECT 'table function that can read only tuple elements';
 INSERT INTO FUNCTION file(currentDatabase() || '_05257.tsv', 'TSV', 'tup Tuple(a String, b Int32), arr Array(UInt32)')
 SETTINGS engine_file_truncate_on_insert = 1 VALUES (('x', 1), [1, 2]), (('y', 2), [3]);
 SELECT countIf(explain LIKE '%column_name: tup.a,%'), countIf(explain LIKE '%column_name: arr.size0,%')

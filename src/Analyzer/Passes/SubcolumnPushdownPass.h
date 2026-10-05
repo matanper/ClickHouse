@@ -14,6 +14,9 @@ namespace DB
   *
   * This enables subcolumn pruning - only the needed subcolumns are read.
   *
+  * Only a subquery that is a single SELECT (a QueryNode, not a UnionNode) and is the whole join tree
+  * of the outer query is rewritten.
+  *
   * Only direct subcolumn accesses (getSubcolumn calls) are pushed. Functions that FunctionToSubcolumnsPass
   * turns into subcolumn reads for table columns (length(arr), tupleElement(tup, 'a'), ...) are not.
   *

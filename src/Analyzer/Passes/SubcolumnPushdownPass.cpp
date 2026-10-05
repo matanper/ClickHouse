@@ -16,9 +16,12 @@
 #include <Analyzer/Utils.h>
 
 #include <Core/Settings.h>
+#include <DataTypes/DataTypeTuple.h>
 #include <Functions/FunctionFactory.h>
 #include <Storages/IStorage.h>
 #include <Storages/StorageSnapshot.h>
+
+#include <boost/algorithm/string/predicate.hpp>
 
 namespace DB
 {
@@ -54,19 +57,54 @@ StorageSnapshotPtr getStorageSnapshotForColumnSource(const QueryTreeNodePtr & co
     return nullptr;
 }
 
-/// Whether the storage behind `proj_column` can serve its subcolumn directly. This is the same gate
-/// `FunctionToSubcolumnsPass` applies before reading a subcolumn instead of the whole column: some storages
-/// (system tables, `file`, `url`, ...) report `supportsOptimizationToSubcolumns` = false, virtual columns and
-/// columns the storage does not know under that exact type cannot be read as subcolumns either.
-bool storageCanReadSubcolumn(const ColumnNode & proj_column, const QueryTreeNodePtr & proj_source, const ContextPtr & context)
+/// Whether a storage that serves only tuple elements (see `IStorage::supportsOptimizationToTupleElementSubcolumns`),
+/// such as `file`, `url` or object storages, can serve `<column>.<subcolumn_name>` as the element `subcolumn_name`
+/// of the tuple `column`. Such a storage matches the flattened name against the schema of the file by string, so
+/// the same guards apply as for `tupleElement` in `FunctionToSubcolumnsPass`: the element has to be named
+/// explicitly, the name must not be ambiguous after flattening, and no column of the storage may claim the
+/// flattened name, not even up to case.
+bool storageCanReadTupleElement(const StorageSnapshotPtr & storage_snapshot, const NameAndTypePair & column, const String & subcolumn_name)
+{
+    if (!storage_snapshot->storage.supportsOptimizationToTupleElementSubcolumns())
+        return false;
+
+    /// A `Nullable(Tuple(...))` is not accepted: the element of a NULL tuple is not the same in every reader.
+    const auto * tuple_type = typeid_cast<const DataTypeTuple *>(column.type.get());
+    if (!tuple_type || !tuple_type->hasExplicitNames())
+        return false;
+
+    /// A nested element (`tup.a.b`) or a dotted element name can be bound to a different path of the file schema.
+    if (subcolumn_name.contains('.') || !tuple_type->tryGetPositionByName(subcolumn_name))
+        return false;
+
+    for (const auto & element_name : tuple_type->getElementNames())
+    {
+        if (element_name != subcolumn_name && boost::iequals(element_name, subcolumn_name))
+            return false;
+    }
+
+    const String full_subcolumn_name = column.name + "." + subcolumn_name;
+    for (const auto & storage_column : storage_snapshot->getColumns(GetColumnsOptions::All))
+    {
+        if (boost::iequals(storage_column.name, full_subcolumn_name))
+            return false;
+    }
+
+    return true;
+}
+
+/// Whether the storage behind `proj_column` can serve its subcolumn `subcolumn_name` directly. This is the same
+/// gate `FunctionToSubcolumnsPass` applies before reading a subcolumn instead of the whole column: some storages
+/// (system tables, ...) report `supportsOptimizationToSubcolumns` = false, others (`file`, `url`, ...) can serve
+/// only tuple elements, virtual columns and columns the storage does not know under that exact type cannot be
+/// read as subcolumns either.
+bool storageCanReadSubcolumn(const ColumnNode & proj_column, const String & subcolumn_name, const QueryTreeNodePtr & proj_source, const ContextPtr & context)
 {
     auto storage_snapshot = getStorageSnapshotForColumnSource(proj_source);
     if (!storage_snapshot)
         return false;
 
     const auto & storage = storage_snapshot->storage;
-    if (!storage.supportsOptimizationToSubcolumns())
-        return false;
 
     /// The storage is replaced with the view source only after the passes, see `FunctionToSubcolumnsPass`.
     auto view_source = context->getViewSource();
@@ -78,7 +116,10 @@ bool storageCanReadSubcolumn(const ColumnNode & proj_column, const QueryTreeNode
         return false;
 
     auto column_in_table = storage_snapshot->tryGetColumn(GetColumnsOptions(GetColumnsOptions::All).withSubcolumns(), column.name);
-    return column_in_table && column_in_table->type->equals(*column.type);
+    if (!column_in_table || !column_in_table->type->equals(*column.type))
+        return false;
+
+    return storage.supportsOptimizationToSubcolumns() || storageCanReadTupleElement(storage_snapshot, column, subcolumn_name);
 }
 
 /// Check if a projection column can be optimized and return the new projection node.
@@ -101,9 +142,9 @@ QueryTreeNodePtr tryCreateSubcolumnProjectionNode(
     /// We can create a direct ColumnNode for the subcolumn (e.g., tup.a) if the storage supports it.
     if (proj_source_type == QueryTreeNodeType::TABLE || proj_source_type == QueryTreeNodeType::TABLE_FUNCTION)
     {
-        /// Some storage engines don't support subcolumn optimization (e.g., system tables, `file`).
-        /// Skip optimization for those to avoid errors.
-        if (proj_column->hasExpression() || !storageCanReadSubcolumn(*proj_column, proj_source, context))
+        /// Some storage engines don't support subcolumn optimization (e.g., system tables), or support it only
+        /// for tuple elements (e.g., `file`). Skip optimization for those to avoid errors.
+        if (proj_column->hasExpression() || !storageCanReadSubcolumn(*proj_column, subcolumn_name, proj_source, context))
             return nullptr;
 
         /// The name has to be built from the name of the column in the table, which is not necessarily
@@ -351,6 +392,7 @@ public:
 
         /// We can only push down into QueryNode sources (subqueries), not tables directly.
         /// Tables are already handled by FunctionToSubcolumnsPass.
+        /// A `UnionNode` source is not supported: every branch would have to be rewritten in the same way.
         if (!query_source)
             return;
 
